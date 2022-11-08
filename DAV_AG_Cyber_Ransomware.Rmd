@@ -1,0 +1,468 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# Risk Model
+
+## 1. Parameter for Frequency
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+
+# Basisschadenfrequenz
+basisfrequenz <- 1.0/100
+
+# Modifikatoren
+freq_industry <- as.data.frame(list(
+  class = c("A", "C", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "P", "Q", "R", "S", "O", "D", "B"), 
+  freq_industry_absolute = c(13.7, 14.5, 8.9, 9.9, 14.5, 8.7, 10.6, 6.7, 4.8, 12.5, 15.7, 9.1, 16.4, 11.8, 14.5, 3.2, 12.5, 12.5, 2.5), 
+  freq_industry_relative = c(1.096, 1.16, 0.712, 0.792, 1.16, 0.696, 0.848, 0.536, 0.384, 1, 1.256, 0.728, 1.312, 0.944, 1.16, 0.256, 1, 1, 1)))
+
+freq_beschäftgotengrößenklasse <- as.data.frame(list(
+  class = c("0-9", "10-49", "50-249", "250-499", "Ab 500"), 
+  beschäftgotengrößenklasse_absolute = c(11.5, 11.5, mean(15, 16.1), 19.4, 22.4), 
+  beschäftgotengrößenklasse_relative = c(0.92, 0.92, mean(1.2, 1.288), 1.552, 1.792)))
+
+get_frequency <- function(Wirtschaftszweig_ID, beschaeftigte) {
+  Wirtschaftszweig_ID <- substr(Wirtschaftszweig_ID, 1, 1)
+  size_mod <- freq_beschäftgotengrößenklasse$beschäftgotengrößenklasse_relative[freq_beschäftgotengrößenklasse$class == beschaeftigte]
+  industry_mod <- freq_industry$freq_industry_relative[freq_industry$class == Wirtschaftszweig_ID]
+  
+  return(basisfrequenz * size_mod * industry_mod)
+}
+
+get_frequency("A", "Ab 500")
+```
+
+## 2. Severity
+
+```{r}
+# Our test portfolio
+portfolio <- read_excel("./Portfoliodaten.xlsx", sheet = "Risiken")
+names(portfolio) <- c("ID", "Wirtschaftszweig_ID", "Wirtschaftszweig_Bezeichnung", 
+"Umsatz_Größenklasse", "Beschäftigten Größenklasse", "e-commerce", 
+"Deckungstyp", "Anteil")
+deckungen <- read_excel("./Deckungen.xlsx") %>%
+  rename(deductible = Dedeuctible) %>% 
+  rename(limit = Limit) %>%  
+  tidyr::pivot_wider(names_from = Deckung, values_from = limit, values_fill = 0) 
+  
+portfolio <- merge(x = portfolio, y = deckungen, by = "ID", all.x=TRUE)
+
+```
+
+
+```{r}
+beta_revenue <- 0.23
+# INDUSTRIE SEKTOR
+sec_from_paper <- tibble(
+  sec = c(
+    'manufactoring',
+    'construction',
+    'wholesale_trade',
+    'retail_trade',
+    'transportation_and_storage',
+    'accomodation_food_beverage',
+    'information_and_communication',
+    'financial_and_insurance',
+    'real_estate',
+    'professional_scientific_technical',
+    'administrative_andsuport_service'),
+  fixed_effect = c(12.7, 12, 12.3, 12.3, 12.5, 12.9, 11.8, 12.1, 13, 12.4, 11.6))
+
+mean_effect <- mean(sec_from_paper$fixed_effect)
+
+sectors <- portfolio %>% distinct(Wirtschaftszweig_ID, Wirtschaftszweig_Bezeichnung) %>%
+mutate( sec = case_when( Wirtschaftszweig_ID %in% c('L') ~ 'real_estate',
+    Wirtschaftszweig_ID %in% c('I') ~ 'accomodation_food_beverage',
+    Wirtschaftszweig_ID %in% c('F') ~ 'construction',
+    Wirtschaftszweig_ID %in% c('J','J4','J3','J2','J5','J6','J1') ~ 'information_and_communication',
+    Wirtschaftszweig_ID %in% c('C') ~ 'manufactoring',
+    Wirtschaftszweig_ID %in% c('M','M1', 'M2', 'M3', 'M4', 'M5','M6','M7') ~ 'professional_scientific_technical',
+    Wirtschaftszweig_ID %in% c('G','G4') ~ 'retail_trade',
+    Wirtschaftszweig_ID %in% c('H') ~ 'transportation_and_storage',
+    Wirtschaftszweig_ID %in% c('G2') ~ 'wholesale_trade'))%>%
+  left_join(sec_from_paper, by = 'sec') %>%
+  mutate(sev_industry = fixed_effect) %>% 
+  mutate(sev_industry = case_when(is.na(sev_industry)== FALSE ~ fixed_effect,
+                                  TRUE ~ mean_effect)) %>% 
+  select(Wirtschaftszweig_ID, sev_industry) 
+
+revenue_sev <-
+  data.frame(
+    umsatzklasse = c(
+      "2.000.000 - 0",
+      "5.000.000 - 2.000.001",
+      ">10.000.000",
+      "10.000.000 - 5.000.001"),
+    umsatz = c(1e6, 3.5e6, 20e6, 7.5e6)
+  )
+
+get_mu <- function(alpha = 2.93, revenue_class, Wirtschaftszweig_ID){
+  size_mod <- beta_revenue * log(revenue_sev$umsatz[revenue_sev$umsatzklasse == revenue_class])
+  industry_mod <- sectors$sev_industry[sectors$Wirtschaftszweig_ID == Wirtschaftszweig_ID]/mean(sectors$sev_industry)
+  return(alpha + size_mod + industry_mod)
+}
+
+get_sigma <- function(beta = 1.642885){
+  return(beta)
+}
+
+sim_loss <- function(revenue_class, Wirtschaftszweig_ID)
+{
+  return(rlnorm(1, 
+                get_mu(revenue_class = revenue_class, 
+                       Wirtschaftszweig_ID = Wirtschaftszweig_ID), 
+                get_sigma()) * rep(1/5, 5))
+}
+
+get_mu(revenue_class = "5.000.000 - 2.000.001", Wirtschaftszweig_ID = "S")
+get_sigma()
+sim_loss(revenue_class = "5.000.000 - 2.000.001", Wirtschaftszweig_ID = "A")
+```
+
+## 3. Frequency Severity Model 
+```{r}
+sim_risk <- function(n, Wirtschaftszweig_ID, revenue_class, beschaeftigte){
+  freq <- get_frequency(Wirtschaftszweig_ID = Wirtschaftszweig_ID, 
+                        beschaeftigte = beschaeftigte)
+  n_claims <- rpois(n, freq)
+  year_claims <- lapply(n_claims, function(number){
+    ifelse(number == 0, 
+           0, 
+           sum(vapply(1:number, function(x) sim_loss(revenue_class = revenue_class, 
+                                                Wirtschaftszweig_ID = Wirtschaftszweig_ID),
+                      FUN.VALUE = c(1, 1, 1, 1, 1))))
+  })
+  return(unlist(year_claims))
+}
+
+Wirtschaftszweig_ID = "A"
+revenue_class = "5.000.000 - 2.000.001"
+beschaeftigte = "Ab 500"
+
+sim_risk(100, Wirtschaftszweig_ID, revenue_class, beschaeftigte)
+```
+
+## 4. Zielgerichtete und nicht-zielgerichtete Angriffe (Targeted and untargeted attacks)
+
+Die Basisfrequenz wird aufgeteilt in zeilgerichtete und nicht-zielgerichtete Angriffe. Von den nicht-zielgerichteten Angriffen, trifft ein Teil einzelne Industrien und ein Teil potenziell alle Risiken. Zusätzlich gehört zu jeden nicht-zielgerichteten Angriff noch eine Eintrittswahrscheinlichkeit, die mit eine Beta Verteilung gezogen wird. Es werden also nicht alle Unternehmen gleichzeitig getroffen, sondern der Eintritt wird zufällig bestimmt.
+```{r}
+
+share_targeted <- 0.8
+lambda_targeted <- basisfrequenz * share_targeted
+
+# Success probabilty of untargeted attacks is drawn with beta distribution
+success_prob_event_expected <- 0.1
+
+get_success_prob <- function()
+{
+  return(rbeta(1, 0.5, 4.5))
+}
+
+share_untargeted_single_industry <- 0.8
+
+lambda_untargeted <- basisfrequenz * ( 1 - share_targeted) / success_prob_event_expected * share_untargeted_single_industry
+lambda_untargeted_all_industries <- lambda_untargeted * (1-share_untargeted_single_industry)/share_untargeted_single_industry
+
+# Calculate the expected frequency of targeted attacks for each insured
+portfolio <- portfolio %>%
+  rowwise() %>% 
+  mutate(lambda_targeted = unname(share_targeted * get_frequency(Wirtschaftszweig_ID, 
+                                                                 `Beschäftigten Größenklasse`)))
+
+# Lambda for untargeted attack on each industry
+lambda_untargeted_per_industry <- freq_industry$freq_industry_relative * (lambda_untargeted - lambda_untargeted_all_industries) 
+
+stopifnot(lambda_untargeted_all_industries < min(freq_industry$freq_industry_relative) * lambda_untargeted)
+```
+
+2. Severity
+
+Versicherter Schaden mit Anwendung von Deductible und Limit.
+```{r}
+sim_insured_loss <- function(number, revenue_class, Wirtschaftszweig_ID, deductible, limit){
+  if(number == 0){return(0)}
+  loss <- unlist(lapply(1:number, function(x)
+    return(sum(pmin(
+      pmax(sim_loss(revenue_class = revenue_class, 
+                    Wirtschaftszweig_ID = Wirtschaftszweig_ID) - deductible, 
+           0), 
+      limit)))))
+  return(sum(loss))
+}
+```
+
+3. Simulation Model for one year
+
+simulate_year generiert den zufälligen Gesamtschaden eines Jahres
+```{r}
+get_loss_per_event <- function(industry)
+{
+  relevant_portfolio <-
+    portfolio[substr(portfolio$Wirtschaftszweig_ID, 1, 1) == industry, ]
+  if (dim(relevant_portfolio)[1] == 0) {
+    return(0)
+  }
+  
+  success <-
+    rbinom(length(relevant_portfolio$Wirtschaftszweig_ID),
+           1,
+           get_success_prob())
+  
+  return(sum(unlist(
+    lapply(1:length(relevant_portfolio$Wirtschaftszweig_ID), 
+           function(x) ifelse(success[x] == 0, 
+                              return(0), 
+                              return(sim_insured_loss(
+                                1, 
+                                relevant_portfolio$`Umsatz_Größenklasse`[x], 
+                                relevant_portfolio$Wirtschaftszweig_ID[x],
+                                portfolio$deductible[x], 
+                                c(relevant_portfolio$ES[x],
+                                  relevant_portfolio$DS[x],
+                                  relevant_portfolio$RS[x],
+                                  relevant_portfolio$EA[x],
+                                  relevant_portfolio$VT[x]))))))))
+}
+
+get_loss_per_event_all_industries <- function()
+{
+  success <- rbinom(length(portfolio$Wirtschaftszweig_ID), 
+                    1, 
+                    get_success_prob())
+  
+  return(sum(unlist(
+    lapply(1:length(portfolio$Wirtschaftszweig_ID), 
+           function(x) ifelse(success[x] == 0, 
+                              return(0), 
+                              return(sim_insured_loss(
+                                1,
+                                portfolio$`Umsatz_Größenklasse`[x],
+                                portfolio$Wirtschaftszweig_ID[x],
+                                portfolio$deductible[x],
+                                c(portfolio$ES[x],
+                                  portfolio$DS[x],
+                                  portfolio$RS[x],
+                                  portfolio$EA[x],
+                                  portfolio$VT[x]))))))))
+}
+
+get_loss_single_industry <- function(industry, events_per_industry)
+{
+    number_events <- events_per_industry[industry]
+    ifelse(number_events == 0, 
+           return(c(0)),
+           return(sum(unlist(
+             lapply(1:number_events,
+                    function(x) get_loss_per_event(industry))))))
+}
+
+get_loss_per_industry <- function(events_per_industry)
+  {
+  unlist(lapply(1:length(events_per_industry), 
+                function(x) get_loss_single_industry(x, events_per_industry)))
+}
+
+
+simulate_year <- function(portfolio)
+{
+# Pro Risiko wird die Anzahl der zielgerichteten Angriffe bestimmt
+  number_targeted <- unlist(lapply(portfolio$lambda_targeted, 
+                                   function(lambda) return(rpois(1, lambda))))
+# Für jedes Risiko und jede Schadenanzahl wird der versicherte Schaden bestimmt
+  agg_losses <- unlist(mapply(sim_insured_loss, 
+                              number_targeted, 
+                              portfolio$`Umsatz_Größenklasse`, 
+                              portfolio$Wirtschaftszweig_ID, 
+                              portfolio$deductible, 
+                              lapply(1:length(number_targeted), 
+                                     function(x) return(c(portfolio$ES[x],
+                                                          portfolio$DS[x],
+                                                          portfolio$RS[x],
+                                                          portfolio$EA[x],
+                                                          portfolio$VT[x])))))
+
+# Für Jede Industrie wird die Anzahl der nicht-zielgerichteten Angriffe 
+  events_per_industry <- unlist(lapply(
+    lambda_untargeted_per_industry, 
+    function(lambda) return(rpois(1,lambda))))
+# Und eine Anzahl für die nicht-zielgerichteten Angriffe, die alle Unternehmen treffen können
+  events_all_industries <- rpois(1, lambda_untargeted_all_industries)
+
+# Pro Industrie wird dann der Schaden simuliert
+  loss_events_per_industry <- get_loss_per_industry(events_per_industry)
+# Und nochmal für die nicht-zielgerichteten Angriffe, die alle Unternehmen treffen können
+  loss_events_all_industry <- ifelse(
+    events_all_industries == 0, 
+    c(0),
+    unlist(lapply(1:events_all_industries,
+                  function(event) get_loss_per_event_all_industries())))
+
+  event_loss <- sum(loss_events_per_industry) + loss_events_all_industry
+  total_loss <- event_loss + sum(agg_losses)
+  return(total_loss)
+}
+simulate_year(portfolio)
+```
+
+4. Simulation von 10000 Jahren
+```{r}
+tictoc::tic()
+years <- vapply(1:10000, function(x) simulate_year(portfolio), FUN.VALUE = c(1))
+tictoc::toc()
+```
+
+5. Plot der AEP Kurve und Ausgabe EW und StDev
+```{r}
+print(paste("EW:", mean(years), "StDev:", sd(years)))
+```
+
+
+```{r}
+AEP <- data.frame(loss = sort(years), 
+                  return_period = c(1/(((length(years)-1):1)/length(years)), 
+                                    99e9))
+
+ggplot(data=AEP, aes(x=return_period, y=loss, group=1)) +
+  geom_line() + 
+  coord_cartesian(xlim = c(0, 500), ylim=c(0,30e5)) +
+  theme_light() + 
+  xlab("Return Period") + 
+  ylab("Yearly Loss Amount")
+```
+
+
+# Model with assoiated point processes
+
+sim_year_associated_point_process generiert den Jahresgesamtschaden, welcher aus einzelnen Schäden und Events besteht. sim_events erzeugt die Return Periods pro Risiko wie folgt. Return Periods werden aus Exponential verteilten Zufallszahlen erzeugt (einmal!). Diese werden mit einem Faktor pro Risiko und einen Faktor pro Industrie multipliziert. Diese sind jeweils LogNormal verteilt mit Erwartungswert 1.
+
+```{r}
+# Parameter form Excel sheet from Mathias
+sigma_event_single <- 3
+mu_event_single <- -4.5
+
+sigma_event_sektor <- 0.03
+mu_event_sektor <- -0.00045
+
+frequency_share_non_event <- 0.8
+
+portfolio_associated <- portfolio %>% 
+  mutate(mu = get_mu(revenue_class = `Umsatz_Größenklasse`, 
+                     Wirtschaftszweig_ID = Wirtschaftszweig_ID)) %>% 
+  mutate(sigma = get_sigma()) %>% 
+  mutate(freq =  get_frequency(Wirtschaftszweig_ID, 
+                               `Beschäftigten Größenklasse`)) %>% 
+  select(deductible, ES, DS, RS, EA, VT, freq, mu, sigma, Wirtschaftszweig_ID)
+
+sim_year_associated_point_process <- function(portfolio)
+{
+  single_losses <- sim_single_losses(portfolio)
+  event_losses <- sim_events(portfolio)
+  return(single_losses + event_losses)
+}
+
+sim_single_losses <- function(portfolio)
+{
+  single_losses <- apply(portfolio %>% select(-Wirtschaftszweig_ID), 
+                         1 ,
+                         function(x) sim_single_losses_risk(x, frequency_share_non_event))
+  return(sum(unlist(single_losses)))
+}
+
+sim_events <- function(portfolio)
+{
+    rps <- sim_return_perdiods()
+    rps <- vapply(1:dim(portfolio)[1], function(x) rps, FUN.VALUE = rep(0.1, 100))
+    single_factor <- matrix(rlnorm(dim(portfolio)[1] * 100, meanlog = mu_event_single, sdlog = sigma_event_single), nrow = 100)
+    industry_rp <- matrix(rlnorm(length(freq_industry$class) * 100, meanlog = mu_event_sektor, sdlog = sigma_event_sektor), 
+                              ncol = length(freq_industry$class))
+    colnames(industry_rp) <- freq_industry$class
+    industry_factor <- industry_rp[, substr(portfolio$Wirtschaftszweig_ID, 1, 1)]
+    rps <- rps * single_factor * industry_factor
+    portfolio_rps <- cbind(portfolio %>% select(-Wirtschaftszweig_ID), t(rps))
+    number_portfolio_columns = ncol(portfolio) - 1
+    event_losses <- apply(portfolio_rps, 1, function(x) sim_single_losses_event(x[1:number_portfolio_columns], 
+                                                               x[(number_portfolio_columns + 1):length(x)], 
+                                                               1 - frequency_share_non_event))
+    return(sum(unlist(event_losses)))
+}
+  
+
+sim_single_losses_risk <- function(risk, frequency_share)
+{
+  rps <- sim_return_perdiods()
+  
+  losses <- vapply(rps, 
+                   function(x) sum(pmin(pmax(0, 
+                                       return_period_to_loss(
+                                         x, 
+                                         risk['mu'], 
+                                         risk['sigma'], 
+                                         risk['freq'] * frequency_share) * rep(1/5, 5) - risk['deductible']), 
+                                       c(risk['ES'], 
+                                         risk['DS'], 
+                                         risk['RS'], 
+                                         risk['EA'], 
+                                         risk['VT']))), 
+                   FUN.VALUE = c(1))
+  return(sum(losses))
+}
+
+sim_single_losses_event <- function(risk, rps, frequency_share)
+{
+  losses <- vapply(rps, 
+                   function(x) sum(pmin(pmax(0, 
+                                       return_period_to_loss(
+                                         x, 
+                                         risk['mu'], 
+                                         risk['sigma'], 
+                                         risk['freq'] * frequency_share) * rep(1/5, 5) - risk['deductible']), 
+                                       c(risk['ES'], 
+                                         risk['DS'], 
+                                         risk['RS'], 
+                                         risk['EA'], 
+                                         risk['VT']))), 
+                   FUN.VALUE = c(1))
+  return(sum(losses))
+}
+
+return_period_to_loss <- function(rp, mu, sigma, lambda)
+{
+  probability_of_non_occurrence <- exp(-1/rp)
+  
+  if(probability_of_non_occurrence < exp(-lambda)) {
+    return(0)
+  } else {
+    return(qlnorm( (probability_of_non_occurrence-exp(-lambda)) / (1-exp(-lambda)), meanlog = mu, sdlog = sigma))
+  }
+}
+
+sim_return_perdiods <- function(){
+  return(1/cumsum(rexp(100)))
+}
+```
+
+```{r}
+tictoc::tic()
+years <- vapply(1:10000, function(x) sim_year_associated_point_process(portfolio_associated), FUN.VALUE = c(1))
+tictoc::toc()
+```
+
+```{r}
+print(paste("EW:", mean(years), "StDev:", sd(years)))
+```
+
+```{r}
+AEP <- data.frame(loss = sort(years), 
+                  return_period = c(1/(((length(years)-1):1)/length(years)), 
+                                    99e9))
+
+ggplot(data=AEP, aes(x=return_period, y=loss, group=1)) +
+  geom_line() + 
+  coord_cartesian(xlim = c(0, 500), ylim=c(0,30e5)) +
+  theme_light() + 
+  xlab("Return Period") + 
+  ylab("Yearly Loss Amount")
+```
